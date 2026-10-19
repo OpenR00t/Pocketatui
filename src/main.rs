@@ -3,6 +3,7 @@
 
 //! Pocketatui: a terminal player for Pocket Casts.
 
+mod ads;
 mod api;
 mod app;
 mod art;

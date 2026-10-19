@@ -132,21 +132,48 @@ pub fn merge_spans(mut v: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     out
 }
 
+/// One normalised word of a transcript: lowercase letters and digits only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Word {
+    pub text: String,
+    /// Estimated time (spread evenly across its cue).
+    pub time: f64,
+    /// Index of the cue it came from.
+    pub cue: usize,
+}
+
+/// Words of `cues` with times and cue indexes.
+pub fn words(cues: &[Cue]) -> Vec<Word> {
+    timed_words(cues)
+        .into_iter()
+        .zip(cue_of_each_word(cues))
+        .map(|((text, time), cue)| Word { text, time, cue })
+        .collect()
+}
+
+fn cue_of_each_word(cues: &[Cue]) -> Vec<usize> {
+    cues.iter()
+        .enumerate()
+        .flat_map(|(i, c)| std::iter::repeat_n(i, normalised(&c.text).count()))
+        .collect()
+}
+
+fn normalised(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(|ch| ch.is_alphanumeric())
+                .collect::<String>()
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+}
+
 /// Words of `cues` with times, spread evenly across each cue.
 fn timed_words(cues: &[Cue]) -> Vec<(String, f64)> {
     let mut out = Vec::new();
     for c in cues {
-        let words: Vec<String> = c
-            .text
-            .split_whitespace()
-            .map(|w| {
-                w.chars()
-                    .filter(|ch| ch.is_alphanumeric())
-                    .collect::<String>()
-                    .to_lowercase()
-            })
-            .filter(|w| !w.is_empty())
-            .collect();
+        let words: Vec<String> = normalised(&c.text).collect();
         let n = words.len().max(1) as f64;
         let span = (c.end - c.start).max(0.0);
         for (i, w) in words.into_iter().enumerate() {

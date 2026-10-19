@@ -289,6 +289,9 @@ fn transcript_view(f: &mut Frame, app: &mut App, area: Rect) {
             Style::new().fg(ACCENT_2),
         ));
     }
+    if let Some(s) = app.ad_status() {
+        foot.push(Span::styled(format!("{s}   "), meta()));
+    }
     let whisper_own = source == Some(Source::Whisper);
     let keys: &[(&str, &str)] = match (whisper::AVAILABLE, whisper_own) {
         (true, true) if app.can_switch_back() => &[
@@ -396,8 +399,15 @@ fn transcript_view(f: &mut Frame, app: &mut App, area: Rect) {
             height: 1,
             ..body
         };
+        let cue_audio = t.to_audio(t.cues[*i].start);
+        let in_ad = app
+            .ads
+            .iter()
+            .any(|&(a, b)| cue_audio >= a - 0.5 && cue_audio < b);
+        let in_hint = app.sponsor_hints.iter().any(|&(a, b)| (a..=b).contains(i));
         let style = match current {
             Some(c) if *i == c => Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            _ if in_ad => Style::new().fg(BG4).add_modifier(Modifier::CROSSED_OUT),
             Some(c) if *i < c => Style::new().fg(FG4),
             _ => Style::new().fg(FG1),
         };
@@ -407,16 +417,25 @@ fn transcript_view(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Style::new()
         };
-        let marker = if current == Some(*i) { "▌" } else { " " };
+        let (marker, marker_color) = if current == Some(*i) {
+            ("▌", ACCENT)
+        } else if in_ad {
+            ("✂", BG4)
+        } else if in_hint {
+            ("┃", BLUE)
+        } else {
+            (" ", ACCENT)
+        };
         // Shown in your audio's time, so it matches the playbar.
         let ts = if *head {
-            fmt_time(t.to_audio(t.cues[*i].start).max(0.0))
+            fmt_time(cue_audio.max(0.0))
         } else {
             String::new()
         };
+        let ts_style = if in_hint { Style::new().fg(BLUE) } else { meta() };
         let line = Line::from(vec![
-            Span::styled(marker, Style::new().fg(ACCENT)),
-            Span::styled(format!("{ts:>7} "), meta()),
+            Span::styled(marker, Style::new().fg(marker_color)),
+            Span::styled(format!("{ts:>7} "), ts_style),
             Span::styled(text.clone(), style),
         ]);
         f.render_widget(Paragraph::new(line).style(bg), r);
@@ -914,6 +933,30 @@ fn playbar(f: &mut Frame, app: &mut App, area: Rect) {
         .use_unicode(true)
         .ratio(ratio);
     f.render_widget(gauge, gauge_row);
+
+    // Inserted ads (grey, skipped) and likely sponsor reads (blue, only marked).
+    if n.duration > 0.0 && n.episode.uuid == app.transcript_for {
+        let hints = (0..app.sponsor_hints.len()).filter_map(|i| app.hint_span(i));
+        let marks = app
+            .ads
+            .iter()
+            .map(|&s| (s, BG4))
+            .chain(hints.map(|s| (s, BLUE)));
+        let w = f64::from(gauge_row.width);
+        let buf = f.buffer_mut();
+        for ((a, b), color) in marks {
+            let x0 = (a / n.duration * w).floor().max(0.0) as u16;
+            let x1 = ((b / n.duration * w).ceil() as u16).clamp(x0 + 1, gauge_row.width);
+            for x in x0..x1 {
+                let cell = &mut buf[(gauge_row.x + x, gauge_row.y)];
+                if cell.symbol() == "█" {
+                    cell.set_fg(color);
+                } else {
+                    cell.set_bg(color);
+                }
+            }
+        }
+    }
 }
 
 /// The playbar's button row: transport, effects, and the volume meter on the right.
@@ -1105,6 +1148,8 @@ const HELP: &[(&str, &str)] = &[
     ("n", "next in Up Next"),
     ("t", "Trim Silence: off · mild · medium · mad max"),
     ("b", "Voice Boost on / off"),
+    ("B", "play the ad just skipped"),
+    ("$", "jump to the next likely sponsor read (blue)"),
     ("Episodes", ""),
     ("enter", "play now (moves it to the top of Up Next)"),
     ("a", "add to end of Up Next"),

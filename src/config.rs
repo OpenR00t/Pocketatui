@@ -56,6 +56,11 @@ pub struct Config {
     /// Keep the episode's own transcript lined up with your copy of the audio (whose ads
     /// may differ) by checking a short Whisper sample every 30 s. Needs a Whisper build.
     pub transcript_autosync: bool,
+    /// Skip ads stitched into your download: Whisper scans ahead and compares your audio
+    /// with the episode's own transcript. Needs a Whisper build and an episode transcript.
+    pub skip_ads: bool,
+    /// Mark likely host-read sponsor segments (in blue). Never skipped.
+    pub sponsor_hints: bool,
     /// Size cap for cached transcripts and covers, in MB; the least recently used go
     /// first. 0 = no cap. Whisper models aren't counted.
     pub cache_limit_mb: u32,
@@ -155,6 +160,8 @@ impl Default for Config {
             whisper_threads: 0,
             transcribe_ahead: 120,
             transcript_autosync: true,
+            skip_ads: true,
+            sponsor_hints: true,
             cache_limit_mb: 200,
         }
     }

@@ -5,7 +5,7 @@ account: Up Next, New Releases, In Progress and your subscriptions, with your li
 position synced back so the phone app picks up where you left off. Search the directory
 and follow podcasts; Trim Silence (Mild / Medium / Mad Max) and Voice Boost like the
 mobile app; a live transcript of what's playing, from the episode's own transcript or
-transcribed on your machine with Whisper.
+transcribed on your machine with Whisper; and skipping the ads stitched into your download.
 
 Styled in Gruvbox Cove (green primary, aqua second, yellow only for warnings). Podcasts
 show as a grid of cover art, and the playbar shows the playing podcast's cover. Real
@@ -73,6 +73,8 @@ prompt.
 | `n` | next in Up Next |
 | `t` | Trim Silence: Off → Mild → Medium → Mad Max |
 | `b` | Voice Boost on / off |
+| `B` | play the ad that was just skipped |
+| `$` | jump to the next likely sponsor read (to check it) |
 | `a` / `A` | add to the end of Up Next / play next |
 | `d` / `del` | remove from Up Next |
 | `m` / `u` | mark played / unplayed |
@@ -127,6 +129,8 @@ whisper_device = "auto"      # auto | cpu | gpu (gpu needs a cuda/vulkan build; 
 whisper_threads = 0          # CPU threads; 0 = half the cores, at most 8
 transcribe_ahead = 120       # seconds Whisper keeps transcribed ahead of playback
 transcript_autosync = true   # keep episodes' own transcripts in time with your audio (Whisper builds)
+skip_ads = true              # skip ads stitched into your download (Whisper builds; see Ads)
+sponsor_hints = true         # mark likely host-read sponsor segments in blue (never skipped)
 cache_limit_mb = 200         # cap for cached transcripts + covers; 0 = no cap
 ```
 
@@ -174,7 +178,7 @@ Where the text comes from, in order:
 3. **Whisper**, on this machine (with a `whisper` build): the model downloads once from
    Hugging Face (`small.en` ≈ 470 MB; to `%LOCALAPPDATA%\pocketatui\data\models`). It
    transcribes 30-second stretches, keeping `transcribe_ahead` seconds ready ahead of where
-   you are, only while the transcript view is open. mpv decodes the audio, so any episode
+   you are, only while the transcript view is open (or while it's looking for ads, below). mpv decodes the audio, so any episode
    that plays can be transcribed. Results are cached, so an episode is never done twice.
    It runs at below-normal priority.
 
@@ -197,6 +201,35 @@ Transcripts are cached in `%LOCALAPPDATA%\pocketatui\cache\transcripts`, within
 | `medium.en` | 1.5 GB | better; wants a GPU |
 | `large-v3-turbo-q5_0` | 574 MB | best; GPU recommended |
 
+## Ads
+
+**Ads stitched into your download** (skipped, with a Whisper build). Many podcasts have an ad
+server insert ads into each download, so your copy has audio the episode's own transcript
+doesn't. While an episode with its own transcript plays, Whisper transcribes the audio
+ahead of you (at least 5 minutes ahead, so it can see past a long ad break) and compares it
+with the transcript, four words at a time. Speech that matches nowhere is skipped when:
+
+- it's at least 15 seconds long, and
+- the rest of the episode comes later than the transcript says by 10 seconds or more (an ad
+  was inserted), or it's 25+ seconds and 40+ words with no match at all (an ad swapped for
+  one the same length), or it comes before the show starts or after it ends.
+
+The playbar says `Skipped an ad (1:30) · B plays it`. Skipped stretches show grey on the
+progress bar and struck through in Whisper's transcript, and the transcript footer counts
+them. The same comparison keeps the episode's transcript in sync on both sides of each ad.
+Whisper's text is cached, so going back to an episode finds its ads straight away.
+
+It can only see ads that aren't in the transcript, so it needs an episode transcript
+(the publisher's or Pocket Casts') and misses ads read by the hosts. A pre-roll is skipped
+a few seconds in, once Whisper has heard the show start. Turn it off with
+`skip_ads = false`.
+
+**Sponsor reads by the hosts** (marked, not skipped). These are part of the transcript, so
+the comparison can't find them. Instead, phrases like "brought to you by", "promo code" and
+"dot com slash" are looked for; a cluster of them is marked blue on the progress bar and in
+the transcript, and the playbar says `Sponsor read? 12:30–13:45` as you reach one. `$`
+jumps to the next one. The edges are guesses, which is why these are only hints for now.
+
 ## About the API
 
 Pocket Casts has no public API. This uses the private one its web player uses
@@ -215,6 +248,7 @@ that talks to it.
 | `src/ui.rs` | drawing |
 | `src/art.rs` | cover download, disk cache, terminal image protocol |
 | `src/transcript.rs` | transcript formats, current line, cache |
+| `src/ads.rs` | finding inserted ads and sponsor reads |
 | `src/cache.rs` | cache size cap (least recently used go first) |
 | `src/whisper.rs` | local Whisper worker (`whisper` feature) |
 | `src/theme.rs` | Gruvbox Cove colors |

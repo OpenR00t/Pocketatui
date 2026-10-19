@@ -15,6 +15,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
+    ads,
     api::{self, Client},
     art::ArtStore,
     config::{self, Config, EpisodePrefs, TranscribeMode, TrimMode, WHISPER_MODELS},
@@ -23,6 +24,10 @@ use crate::{
     transcript::{self, Source, Transcript},
     whisper::{self, Whisper},
 };
+
+/// Seconds Whisper keeps transcribed ahead while looking for ads: enough to see past a
+/// long ad break to the show again before playback gets there.
+const AD_SCAN_AHEAD: u32 = 300;
 
 /// Results coming back from background tasks.
 pub enum Msg {
@@ -204,6 +209,19 @@ pub struct App {
     align_last: Option<f64>,
     /// Auto-sync / manual sync result, for the footer.
     pub align_status: String,
+    /// Whisper's transcript, built in the background to find ads while the episode's own
+    /// transcript is the one shown.
+    ad_whisper: Option<Transcript>,
+    /// Inserted ads found in the now-playing episode (audio time).
+    pub ads: Vec<(f64, f64)>,
+    /// Likely sponsor reads, as cue index ranges into `transcript`.
+    pub sponsor_hints: Vec<(usize, usize)>,
+    /// Ads the user chose to hear (`B`), by start time.
+    ads_allowed: Vec<f64>,
+    /// The last ad skipped and when.
+    last_ad_skip: Option<((f64, f64), Instant)>,
+    /// Sponsor hint last announced, by first cue.
+    hint_announced: Option<usize>,
     /// Sort / hide-played choice per podcast uuid.
     episode_prefs: HashMap<String, EpisodePrefs>,
 
@@ -292,6 +310,12 @@ impl App {
             align_pending: None,
             align_last: None,
             align_status: String::new(),
+            ad_whisper: None,
+            ads: Vec::new(),
+            sponsor_hints: Vec::new(),
+            ads_allowed: Vec::new(),
+            last_ad_skip: None,
+            hint_announced: None,
             whisper,
             filter: String::new(),
             filtering: false,
@@ -471,6 +495,14 @@ impl App {
                     Some(t) if !forced => {
                         self.transcript = Some(t);
                         self.transcript_state = TranscriptState::Ready;
+                        if whisper::AVAILABLE {
+                            // Built up in the background to find inserted ads.
+                            self.ad_whisper = Some(cached_whisper.unwrap_or_else(|| {
+                                Transcript::new(Source::Whisper, Vec::new())
+                            }));
+                        }
+                        self.transcript_changed();
+                        self.refresh_whisper();
                     }
                     own if whisper::AVAILABLE => {
                         self.own_transcript = own; // `w` switches to it
@@ -479,12 +511,12 @@ impl App {
                         self.transcript = Some(t);
                         self.transcript_state = TranscriptState::Ready;
                         self.whisper_status.clear();
-                        if self.show_transcript {
-                            self.start_whisper();
-                        }
+                        self.transcript_changed();
+                        self.refresh_whisper();
                     }
                     _ => {
                         self.transcript = cached_whisper;
+                        self.transcript_changed();
                         self.transcript_state = if self.transcript.is_some() {
                             TranscriptState::Ready
                         } else {
@@ -616,6 +648,7 @@ impl App {
                     n.position = t;
                     n.loading = false;
                 }
+                self.check_ads(t);
             }
             PlayerEvent::Duration(d) => {
                 if let Some(n) = &mut self.now {
@@ -711,6 +744,12 @@ impl App {
         self.stop_whisper();
         self.transcript = None;
         self.own_transcript = None;
+        self.ad_whisper = None;
+        self.ads.clear();
+        self.sponsor_hints.clear();
+        self.ads_allowed.clear();
+        self.last_ad_skip = None;
+        self.hint_announced = None;
         self.transcript_for = ep.uuid.clone();
         self.transcript_follow = true;
         self.whisper_status.clear();
@@ -765,12 +804,52 @@ impl App {
             None => true,
             Some(at) => pos - at >= 30.0 || pos < at - 2.0,
         };
-        if due {
-            self.whisper
-                .sample(&n.episode.uuid, &n.episode.url, pos, 20.0);
-            self.align_pending = Some(Instant::now());
-            self.align_last = Some(pos);
+        if !due {
+            return;
         }
+        // The ad scan may already have transcribed this stretch.
+        if let Some(w) = &self.ad_whisper
+            && w.covered_until(pos).is_some_and(|e| e >= pos + 20.0)
+        {
+            self.align_last = Some(pos);
+            // Its matches already set the sync here: just report it.
+            if let Some(t) = self.transcript.as_ref().filter(|t| !t.anchors.is_empty()) {
+                self.align_status = format!("auto-synced ({})", offset_label(t.offset_at(pos)));
+                return;
+            }
+            let cues: Vec<_> = w
+                .cues
+                .iter()
+                .filter(|c| c.start >= pos && c.start < pos + 20.0)
+                .cloned()
+                .collect();
+            self.apply_alignment(pos, &cues);
+            return;
+        }
+        self.whisper
+            .sample(&n.episode.uuid, &n.episode.url, pos, 20.0);
+        self.align_pending = Some(Instant::now());
+        self.align_last = Some(pos);
+    }
+
+    /// Line the shown (own) transcript up with Whisper's `cues` of the audio from `at`.
+    fn apply_alignment(&mut self, at: f64, cues: &[transcript::Cue]) {
+        let Some(t) = self
+            .transcript
+            .as_mut()
+            .filter(|t| t.source != Source::Whisper)
+        else {
+            return;
+        };
+        let guess = t.offset_at(at);
+        self.align_status = match transcript::align(&t.cues, cues, guess, 900.0) {
+            Some(off) => {
+                t.set_anchor(at, off);
+                format!("auto-synced ({})", offset_label(off))
+            }
+            None if cues.is_empty() => "auto-sync: no speech here".into(),
+            None => "auto-sync: no match here (an ad?)".into(),
+        };
     }
 
     /// "The highlighted line is what I'm hearing now": line the transcript up by hand.
@@ -808,10 +887,207 @@ impl App {
         let t = self
             .transcript
             .as_ref()
-            .filter(|t| t.source == Source::Whisper);
+            .filter(|t| t.source == Source::Whisper)
+            .or(self.ad_whisper.as_ref());
         self.whisper
             .start(&n.episode.uuid, &n.episode.url, n.position, t);
         self.whisper_active = true;
+    }
+
+    /// Whisper is building `ad_whisper` to find ads in what's playing.
+    pub fn scanning_for_ads(&self) -> bool {
+        whisper::AVAILABLE
+            && self.cfg.skip_ads
+            && self.ad_whisper.is_some()
+            && self
+                .now
+                .as_ref()
+                .is_some_and(|n| n.episode.uuid == self.transcript_for)
+    }
+
+    /// Start or stop Whisper to match what's wanted: the Whisper transcript on screen,
+    /// or the background ad scan.
+    fn refresh_whisper(&mut self) {
+        let showing_whisper = self
+            .transcript
+            .as_ref()
+            .is_some_and(|t| t.source == Source::Whisper);
+        let want = (self.show_transcript && showing_whisper) || self.scanning_for_ads();
+        if want {
+            self.start_whisper();
+        } else {
+            self.stop_whisper();
+        }
+    }
+
+    /// The shown transcript or the ad scan changed: look for ads and sponsor reads again.
+    fn transcript_changed(&mut self) {
+        self.update_ads();
+    }
+
+    fn update_ads(&mut self) {
+        let audio_end = self
+            .now
+            .as_ref()
+            .filter(|n| n.episode.uuid == self.transcript_for && n.duration > 0.0)
+            .map(|n| n.duration);
+        // The episode's own transcript and Whisper's of the audio, whichever is shown.
+        let pair = match &self.transcript {
+            Some(t) if t.source == Source::Whisper => self.own_transcript.as_ref().map(|o| (o, t)),
+            Some(t) => self.ad_whisper.as_ref().map(|w| (t, w)),
+            None => None,
+        };
+        let found = pair.map(|(own, heard)| {
+            let f = ads::find_inserted(&own.cues, &heard.cues, &heard.covered, audio_end);
+            (f, heard.covered.clone())
+        });
+        let (found, covered) = found.unwrap_or_default();
+        self.ads = found.ads;
+        // The scan also knows the sync on both sides of every ad: use it where it has
+        // looked, in place of the sampled or hand-set sync points there.
+        if self.cfg.transcript_autosync && !found.anchors.is_empty() {
+            let own = match &mut self.transcript {
+                Some(t) if t.source == Source::Whisper => self.own_transcript.as_mut(),
+                t => t.as_mut(),
+            };
+            if let Some(own) = own {
+                own.anchors
+                    .retain(|(a, _)| !covered.iter().any(|(x, y)| a >= x && a < y));
+                own.anchors.extend(found.anchors);
+                own.anchors.sort_by(|a, b| a.0.total_cmp(&b.0));
+            }
+            // A "no match" from a sample taken inside an ad is out of date now.
+            if self.align_status.starts_with("auto-sync:") {
+                self.align_status.clear();
+            }
+        }
+        self.sponsor_hints = match (&self.transcript, self.cfg.sponsor_hints) {
+            (Some(t), true) => ads::sponsor_hints(&t.cues)
+                .into_iter()
+                // Inside an inserted ad already? Then it's that ad.
+                .filter(|&(a, b)| {
+                    let (s, e) = (t.to_audio(t.cues[a].start), t.to_audio(t.cues[b].end));
+                    !self.ads.iter().any(|&(x, y)| s < y && x < e)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+    }
+
+    /// What the ad finder has found so far, for the transcript footer.
+    pub fn ad_status(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.ads.is_empty() {
+            let secs: f64 = self.ads.iter().map(|(a, b)| b - a).sum();
+            parts.push(format!(
+                "{} ad{} ({}){}",
+                self.ads.len(),
+                if self.ads.len() == 1 { "" } else { "s" },
+                crate::model::fmt_time(secs),
+                if self.cfg.skip_ads { " skipped" } else { "" }
+            ));
+        }
+        if self.scanning_for_ads() {
+            let pos = self.now.as_ref().map_or(0.0, |n| n.position);
+            if let Some(e) = self.ad_whisper.as_ref().and_then(|w| w.covered_until(pos)) {
+                parts.push(format!("ads checked to {}", crate::model::fmt_time(e)));
+            } else {
+                parts.push("checking for ads…".into());
+            }
+        }
+        if !self.sponsor_hints.is_empty() {
+            let n = self.sponsor_hints.len();
+            parts.push(format!("{n} sponsor read{}? ($)", if n == 1 { "" } else { "s" }));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// Audio-time span of sponsor hint `i`.
+    pub fn hint_span(&self, i: usize) -> Option<(f64, f64)> {
+        let t = self.transcript.as_ref()?;
+        let &(a, b) = self.sponsor_hints.get(i)?;
+        Some((t.to_audio(t.cues[a].start), t.to_audio(t.cues[b].end)))
+    }
+
+    /// Skip an inserted ad that playback has just reached; note a sponsor hint.
+    fn check_ads(&mut self, t: f64) {
+        let Some(n) = &self.now else { return };
+        if n.paused || n.loading || n.episode.uuid != self.transcript_for {
+            return;
+        }
+        if self.cfg.skip_ads
+            && self
+                .last_ad_skip
+                .is_none_or(|(_, at)| at.elapsed() > Duration::from_millis(1500))
+            && let Some(&ad) = self.ads.iter().find(|&&(a, b)| {
+                t >= a && t < b - 1.0 && !self.ads_allowed.iter().any(|x| (x - a).abs() < 5.0)
+            })
+        {
+            self.last_seek = Instant::now();
+            self.player.seek_absolute(ad.1);
+            self.last_ad_skip = Some((ad, Instant::now()));
+            self.info(format!(
+                "Skipped an ad ({}) · B plays it",
+                crate::model::fmt_time(ad.1 - ad.0)
+            ));
+            return;
+        }
+        let hint = (0..self.sponsor_hints.len())
+            .find(|&i| self.hint_span(i).is_some_and(|(a, b)| t >= a && t < b));
+        if let Some(i) = hint {
+            let first = self.sponsor_hints[i].0;
+            if self.hint_announced != Some(first) {
+                self.hint_announced = Some(first);
+                let (a, b) = self.hint_span(i).unwrap_or_default();
+                self.info(format!(
+                    "Sponsor read? {}–{} (a hint, not skipped)",
+                    crate::model::fmt_time(a),
+                    crate::model::fmt_time(b)
+                ));
+            }
+        }
+    }
+
+    /// `B`: go back and play the ad just skipped.
+    fn replay_ad(&mut self) {
+        let Some(((a, _), _)) = self.last_ad_skip.take() else {
+            self.info("No ad skipped yet".into());
+            return;
+        };
+        self.ads_allowed.push(a);
+        self.last_seek = Instant::now();
+        self.player.seek_absolute(a);
+        self.info("Playing the ad".into());
+    }
+
+    /// `$`: jump to the next sponsor hint, to check it.
+    fn next_hint(&mut self) {
+        let Some(pos) = self.now.as_ref().map(|n| n.position) else {
+            return;
+        };
+        let spans: Vec<(f64, f64)> = (0..self.sponsor_hints.len())
+            .filter_map(|i| self.hint_span(i))
+            .collect();
+        let Some(&(a, b)) = spans
+            .iter()
+            .find(|(a, _)| *a > pos + 1.0)
+            .or(spans.first())
+        else {
+            self.info(if self.cfg.sponsor_hints {
+                "No sponsor reads spotted in this transcript".into()
+            } else {
+                "Sponsor hints are off (sponsor_hints in config.toml)".into()
+            });
+            return;
+        };
+        self.last_seek = Instant::now();
+        self.player.seek_absolute((a - 2.0).max(0.0));
+        self.hint_announced = None;
+        self.info(format!(
+            "Sponsor read? {}–{}",
+            crate::model::fmt_time(a),
+            crate::model::fmt_time(b)
+        ));
     }
 
     fn stop_whisper(&mut self) {
@@ -826,25 +1102,9 @@ impl App {
             whisper::Event::Status(s) => self.whisper_status = s,
             whisper::Event::Sample { uuid, at, cues } => {
                 self.align_pending = None;
-                if uuid != self.transcript_for {
-                    return;
+                if uuid == self.transcript_for {
+                    self.apply_alignment(at, &cues);
                 }
-                let Some(t) = self
-                    .transcript
-                    .as_mut()
-                    .filter(|t| t.source != Source::Whisper)
-                else {
-                    return;
-                };
-                let guess = t.offset_at(at);
-                self.align_status = match transcript::align(&t.cues, &cues, guess, 900.0) {
-                    Some(off) => {
-                        t.set_anchor(at, off);
-                        format!("auto-synced ({})", offset_label(off))
-                    }
-                    None if cues.is_empty() => "auto-sync: no speech here".into(),
-                    None => "auto-sync: no match here (an ad?)".into(),
-                };
             }
             whisper::Event::Error(e) => {
                 self.whisper_status = format!("⚠ {e}");
@@ -854,19 +1114,22 @@ impl App {
             whisper::Event::Finished(uuid) => {
                 if uuid == self.transcript_for {
                     self.whisper_status = "transcribed to the end".into();
+                    self.update_ads(); // a post-roll can be judged now
                 }
             }
             whisper::Event::Cues { uuid, span, cues } => {
                 let model = self.cfg.whisper_model.clone();
-                if uuid == self.transcript_for
-                    && let Some(t) = self
-                        .transcript
-                        .as_mut()
-                        .filter(|t| t.source == Source::Whisper)
+                let ours = uuid == self.transcript_for;
+                let shown = self
+                    .transcript
+                    .as_mut()
+                    .filter(|t| t.source == Source::Whisper);
+                if let Some(t) = shown.filter(|_| ours).or(self.ad_whisper.as_mut().filter(|_| ours))
                 {
                     t.add_whisper(span, cues);
                     t.model = model;
                     transcript::save_cached(&uuid, t);
+                    self.transcript_changed();
                 } else {
                     // A stale result for another episode: still cache it.
                     let mut t = transcript::load_whisper(&uuid)
@@ -883,16 +1146,8 @@ impl App {
         self.show_transcript = !self.show_transcript;
         if self.show_transcript {
             self.transcript_follow = true;
-            if self
-                .transcript
-                .as_ref()
-                .is_some_and(|t| t.source == Source::Whisper)
-            {
-                self.start_whisper();
-            }
-        } else {
-            self.stop_whisper();
         }
+        self.refresh_whisper();
     }
 
     /// `w`: switch between the episode's own transcript and Whisper's.
@@ -907,10 +1162,14 @@ impl App {
                 return;
             };
             self.stop_whisper();
+            // What Whisper did carries on as the ad scan.
+            self.ad_whisper = self.transcript.take();
             self.transcript = Some(own);
             self.transcript_state = TranscriptState::Ready;
             self.align_last = None; // re-check the sync from here
             self.transcript_follow = true;
+            self.transcript_changed();
+            self.refresh_whisper();
             self.info("Showing the episode's own transcript".into());
             return;
         }
@@ -926,11 +1185,15 @@ impl App {
             .transcript
             .take()
             .filter(|t| t.source != Source::Whisper);
-        let cached = transcript::load_whisper(&self.transcript_for)
+        let cached = self
+            .ad_whisper
+            .take()
+            .or_else(|| transcript::load_whisper(&self.transcript_for))
             .unwrap_or_else(|| Transcript::new(Source::Whisper, Vec::new()));
         self.transcript = Some(cached);
         self.transcript_state = TranscriptState::Ready;
         self.transcript_follow = true;
+        self.transcript_changed();
         self.stop_whisper();
         self.start_whisper();
         self.info("Transcribing with Whisper · w switches back".into());
@@ -1444,6 +1707,8 @@ impl App {
             KeyCode::Char('-') => self.change_volume(-5.0),
             KeyCode::Char('+') => self.change_volume(5.0),
             KeyCode::Char('n') => self.play_next_in_queue(),
+            KeyCode::Char('B') => self.replay_ad(),
+            KeyCode::Char('$') => self.next_hint(),
             KeyCode::Char('r') => {
                 self.refresh(self.pane);
                 self.info("Refreshing…".into());
@@ -1906,7 +2171,12 @@ fn whisper_settings(cfg: &Config) -> whisper::Settings {
         model: cfg.whisper_model.clone(),
         device: cfg.whisper_device,
         threads: cfg.whisper_threads,
-        ahead: cfg.transcribe_ahead,
+        // Skipping an ad needs the show found again after it, so look further ahead.
+        ahead: if cfg.skip_ads {
+            cfg.transcribe_ahead.max(AD_SCAN_AHEAD)
+        } else {
+            cfg.transcribe_ahead
+        },
         mpv: cfg.mpv_path.clone(),
     }
 }
