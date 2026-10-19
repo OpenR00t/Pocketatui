@@ -25,6 +25,8 @@ pub enum PlayerEvent {
     Speed(f64),
     Volume(f64),
     Buffering(bool),
+    /// mpv began a newly loaded file.
+    Started,
     /// Playback reached the end of the file.
     Finished,
     /// The file couldn't be played.
@@ -278,6 +280,7 @@ pub fn parse_event(v: &Value) -> Vec<PlayerEvent> {
             };
             ev.into_iter().collect()
         }
+        Some("start-file") => vec![PlayerEvent::Started],
         Some("end-file") => match v.get("reason").and_then(Value::as_str) {
             Some("eof") => vec![PlayerEvent::Finished],
             Some("error") => {
@@ -330,6 +333,10 @@ mod tests {
             vec![PlayerEvent::Finished]
         );
         assert!(parse_event(&json!({"event":"end-file","reason":"stop"})).is_empty());
+        assert_eq!(
+            parse_event(&json!({"event":"start-file","playlist_entry_id":2})),
+            vec![PlayerEvent::Started]
+        );
         assert_eq!(
             parse_event(
                 &json!({"event":"end-file","reason":"error","file_error":"loading failed"})

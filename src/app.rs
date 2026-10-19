@@ -17,9 +17,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::{
     api::{self, Client},
     art::ArtStore,
-    config::{self, Config, EpisodePrefs, TrimMode},
+    config::{self, Config, EpisodePrefs, TranscribeMode, TrimMode, WHISPER_MODELS},
     model::{Episode, PlayStatus, Podcast},
     player::{Player, PlayerEvent},
+    transcript::{self, Source, Transcript},
+    whisper::{self, Whisper},
 };
 
 /// Results coming back from background tasks.
@@ -35,6 +37,12 @@ pub enum Msg {
     Details(Vec<Value>),
     /// Directory search results for a query.
     Search(String, anyhow::Result<Vec<Podcast>>),
+    /// The episode's own transcript (publisher or Pocket Casts), or `None` if it has none;
+    /// the second value is any Whisper transcript cached from before.
+    Transcript(String, Option<Transcript>, Option<Transcript>),
+    /// Progress and results from the local Whisper worker.
+    #[cfg_attr(not(feature = "whisper"), allow(dead_code))]
+    Whisper(whisper::Event),
     /// A podcast cover finished loading (`None` if it couldn't be).
     Art(String, Option<image::DynamicImage>),
     Info(String),
@@ -69,6 +77,10 @@ pub enum Hit {
     Table(Pane),
     /// A tile in a podcast grid, by position in the visible list.
     Tile(Pane, usize),
+    /// A line of the transcript view, by cue index (right-click: "I'm hearing this").
+    TranscriptLine(usize),
+    /// The transcript view as a whole (for the wheel).
+    TranscriptArea,
     /// The "‹ back" title of an open podcast.
     Back,
     SearchBox,
@@ -93,6 +105,19 @@ pub enum Control {
     Boost,
     VolumeDown,
     VolumeUp,
+    Transcript,
+}
+
+/// Where the now-playing episode's transcript stands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranscriptState {
+    /// Transcripts are off in the config.
+    Off,
+    Loading,
+    /// Ready to show (fully, or as far as Whisper has got).
+    Ready,
+    /// None available, with the reason.
+    Missing(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +170,9 @@ pub struct App {
     pub trim_saved: f64,
     last_time_pos: Option<(Instant, f64)>,
     last_seek: Instant,
+    /// A new file was requested and mpv hasn't started it yet: events still coming from
+    /// the old file (its position, or its end) must not touch the new episode.
+    awaiting_start: bool,
 
     pub now: Option<NowPlaying>,
     pub speed: f64,
@@ -154,6 +182,28 @@ pub struct App {
     /// Episode details already fetched, by uuid.
     details: HashMap<String, Value>,
     requested: HashSet<String>,
+    /// Transcript of the now-playing episode.
+    pub transcript: Option<Transcript>,
+    pub transcript_for: String,
+    pub transcript_state: TranscriptState,
+    /// What the Whisper worker last said it's doing.
+    pub whisper_status: String,
+    /// Whisper is working on the now-playing episode.
+    pub whisper_active: bool,
+    pub show_transcript: bool,
+    /// Keep the spoken line in view; off once the user scrolls.
+    pub transcript_follow: bool,
+    /// Highlighted line when not following, by cue index.
+    pub transcript_sel: usize,
+    whisper: Whisper,
+    /// The episode's own transcript while Whisper's is shown instead (`w` switches back).
+    own_transcript: Option<Transcript>,
+    /// Auto-sync: a Whisper sample is on its way.
+    align_pending: Option<Instant>,
+    /// Auto-sync: playback position of the last sample.
+    align_last: Option<f64>,
+    /// Auto-sync / manual sync result, for the footer.
+    pub align_status: String,
     /// Sort / hide-played choice per podcast uuid.
     episode_prefs: HashMap<String, EpisodePrefs>,
 
@@ -189,6 +239,7 @@ impl App {
         player.set_speed(speed);
         player.set_effects(cfg.trim_silence, cfg.voice_boost);
         let art = ArtStore::new(cfg.cover_art, picker, tx.clone());
+        let whisper = Whisper::new(tx.clone(), whisper_settings(&cfg));
         let mut app = Self {
             art,
             grid_cols: 1,
@@ -206,6 +257,7 @@ impl App {
             trim_saved: 0.0,
             last_time_pos: None,
             last_seek: Instant::now(),
+            awaiting_start: false,
             cfg,
             api,
             player,
@@ -228,6 +280,19 @@ impl App {
             details: HashMap::new(),
             requested: HashSet::new(),
             episode_prefs: config::load_episode_prefs(),
+            transcript: None,
+            transcript_for: String::new(),
+            transcript_state: TranscriptState::Loading,
+            whisper_status: String::new(),
+            whisper_active: false,
+            show_transcript: false,
+            transcript_follow: true,
+            transcript_sel: 0,
+            own_transcript: None,
+            align_pending: None,
+            align_last: None,
+            align_status: String::new(),
+            whisper,
             filter: String::new(),
             filtering: false,
             show_help: false,
@@ -362,6 +427,7 @@ impl App {
                 };
                 self.player.load(&ep.url, start);
                 self.player.set_speed(self.speed);
+                self.begin_transcript(&ep);
                 if let Some(n) = &mut self.now {
                     n.position = start;
                     n.duration = ep.duration;
@@ -396,6 +462,40 @@ impl App {
                     Err(e) => self.error(err_text(&e)),
                 }
             }
+            Msg::Transcript(uuid, own, cached_whisper) => {
+                if uuid != self.transcript_for {
+                    return;
+                }
+                let forced = self.cfg.transcribe == TranscribeMode::Whisper;
+                match own {
+                    Some(t) if !forced => {
+                        self.transcript = Some(t);
+                        self.transcript_state = TranscriptState::Ready;
+                    }
+                    own if whisper::AVAILABLE => {
+                        self.own_transcript = own; // `w` switches to it
+                        let t = cached_whisper
+                            .unwrap_or_else(|| Transcript::new(Source::Whisper, Vec::new()));
+                        self.transcript = Some(t);
+                        self.transcript_state = TranscriptState::Ready;
+                        self.whisper_status.clear();
+                        if self.show_transcript {
+                            self.start_whisper();
+                        }
+                    }
+                    _ => {
+                        self.transcript = cached_whisper;
+                        self.transcript_state = if self.transcript.is_some() {
+                            TranscriptState::Ready
+                        } else {
+                            TranscriptState::Missing(
+                                "No transcript for this episode. Build with the `whisper` feature to transcribe it locally.".into(),
+                            )
+                        };
+                    }
+                }
+            }
+            Msg::Whisper(ev) => self.whisper_event(ev),
             Msg::Info(m) => self.info(m),
             Msg::Error(m) => self.error(m),
         }
@@ -497,7 +597,19 @@ impl App {
     }
 
     pub fn handle_player(&mut self, ev: PlayerEvent) {
+        if self.awaiting_start
+            && matches!(
+                ev,
+                PlayerEvent::TimePos(_)
+                    | PlayerEvent::Duration(_)
+                    | PlayerEvent::Finished
+                    | PlayerEvent::Failed(_)
+            )
+        {
+            return;
+        }
         match ev {
+            PlayerEvent::Started => self.awaiting_start = false,
             PlayerEvent::TimePos(t) => {
                 self.count_trimmed(t);
                 if let Some(n) = &mut self.now {
@@ -589,6 +701,340 @@ impl App {
         }
     }
 
+    // ---------- transcripts ----------
+
+    /// Look up the transcript for a newly started episode.
+    fn begin_transcript(&mut self, ep: &Episode) {
+        if self.transcript_for == ep.uuid && self.transcript.is_some() {
+            return;
+        }
+        self.stop_whisper();
+        self.transcript = None;
+        self.own_transcript = None;
+        self.transcript_for = ep.uuid.clone();
+        self.transcript_follow = true;
+        self.whisper_status.clear();
+        self.align_last = None;
+        self.align_pending = None;
+        self.align_status.clear();
+        if self.cfg.transcribe == TranscribeMode::Off {
+            self.transcript_state = TranscriptState::Off;
+            return;
+        }
+        self.transcript_state = TranscriptState::Loading;
+        let api = self.api.clone();
+        let (uuid, podcast) = (ep.uuid.clone(), ep.podcast_uuid.clone());
+        self.spawn(async move {
+            let own = transcript::load_cached(&uuid);
+            let whisper = transcript::load_whisper(&uuid);
+            if own.is_some() {
+                return Msg::Transcript(uuid, own, whisper);
+            }
+            let own = fetch_own_transcript(&api, &podcast, &uuid).await;
+            if let Some(t) = &own {
+                transcript::save_cached(&uuid, t);
+            }
+            Msg::Transcript(uuid, own, whisper)
+        });
+    }
+
+    /// Every 30 s of playback (and after a jump), have Whisper transcribe 20 s at the
+    /// current position and line the episode's own transcript up with it.
+    fn maybe_autosync(&mut self) {
+        if let Some(at) = self.align_pending {
+            if at.elapsed() < Duration::from_secs(60) {
+                return;
+            }
+            self.align_pending = None; // never answered; try again
+        }
+        if !(whisper::AVAILABLE && self.cfg.transcript_autosync && self.show_transcript) {
+            return;
+        }
+        let Some(n) = self.now.as_ref().filter(|n| !n.loading && !n.paused) else {
+            return;
+        };
+        let own = self
+            .transcript
+            .as_ref()
+            .is_some_and(|t| t.source != Source::Whisper && !t.cues.is_empty());
+        if !own || n.episode.uuid != self.transcript_for {
+            return;
+        }
+        let pos = n.position;
+        let due = match self.align_last {
+            None => true,
+            Some(at) => pos - at >= 30.0 || pos < at - 2.0,
+        };
+        if due {
+            self.whisper
+                .sample(&n.episode.uuid, &n.episode.url, pos, 20.0);
+            self.align_pending = Some(Instant::now());
+            self.align_last = Some(pos);
+        }
+    }
+
+    /// "The highlighted line is what I'm hearing now": line the transcript up by hand.
+    fn sync_to_line(&mut self, i: usize) {
+        let Some(pos) = self.now.as_ref().map(|n| n.position) else {
+            return;
+        };
+        let Some(t) = self.transcript.as_mut() else {
+            return;
+        };
+        let Some(c) = t.cues.get(i) else { return };
+        let off = c.start - pos;
+        t.set_anchor(pos, off);
+        self.align_last = Some(pos);
+        self.align_status = format!("synced by hand ({})", offset_label(off));
+        self.transcript_follow = true;
+    }
+
+    fn clear_sync(&mut self) {
+        if let Some(t) = self.transcript.as_mut() {
+            t.anchors.clear();
+        }
+        self.align_last = None;
+        self.align_status = "sync cleared".into();
+    }
+
+    fn start_whisper(&mut self) {
+        if !whisper::AVAILABLE || self.whisper_active {
+            return;
+        }
+        let Some(n) = &self.now else { return };
+        if n.episode.uuid != self.transcript_for {
+            return;
+        }
+        let t = self
+            .transcript
+            .as_ref()
+            .filter(|t| t.source == Source::Whisper);
+        self.whisper
+            .start(&n.episode.uuid, &n.episode.url, n.position, t);
+        self.whisper_active = true;
+    }
+
+    fn stop_whisper(&mut self) {
+        if self.whisper_active {
+            self.whisper.stop();
+            self.whisper_active = false;
+        }
+    }
+
+    fn whisper_event(&mut self, ev: whisper::Event) {
+        match ev {
+            whisper::Event::Status(s) => self.whisper_status = s,
+            whisper::Event::Sample { uuid, at, cues } => {
+                self.align_pending = None;
+                if uuid != self.transcript_for {
+                    return;
+                }
+                let Some(t) = self
+                    .transcript
+                    .as_mut()
+                    .filter(|t| t.source != Source::Whisper)
+                else {
+                    return;
+                };
+                let guess = t.offset_at(at);
+                self.align_status = match transcript::align(&t.cues, &cues, guess, 900.0) {
+                    Some(off) => {
+                        t.set_anchor(at, off);
+                        format!("auto-synced ({})", offset_label(off))
+                    }
+                    None if cues.is_empty() => "auto-sync: no speech here".into(),
+                    None => "auto-sync: no match here (an ad?)".into(),
+                };
+            }
+            whisper::Event::Error(e) => {
+                self.whisper_status = format!("⚠ {e}");
+                self.error(e);
+                self.whisper_active = false;
+            }
+            whisper::Event::Finished(uuid) => {
+                if uuid == self.transcript_for {
+                    self.whisper_status = "transcribed to the end".into();
+                }
+            }
+            whisper::Event::Cues { uuid, span, cues } => {
+                let model = self.cfg.whisper_model.clone();
+                if uuid == self.transcript_for
+                    && let Some(t) = self
+                        .transcript
+                        .as_mut()
+                        .filter(|t| t.source == Source::Whisper)
+                {
+                    t.add_whisper(span, cues);
+                    t.model = model;
+                    transcript::save_cached(&uuid, t);
+                } else {
+                    // A stale result for another episode: still cache it.
+                    let mut t = transcript::load_whisper(&uuid)
+                        .unwrap_or_else(|| Transcript::new(Source::Whisper, Vec::new()));
+                    t.add_whisper(span, cues);
+                    t.model = model;
+                    transcript::save_cached(&uuid, &t);
+                }
+            }
+        }
+    }
+
+    fn toggle_transcript_view(&mut self) {
+        self.show_transcript = !self.show_transcript;
+        if self.show_transcript {
+            self.transcript_follow = true;
+            if self
+                .transcript
+                .as_ref()
+                .is_some_and(|t| t.source == Source::Whisper)
+            {
+                self.start_whisper();
+            }
+        } else {
+            self.stop_whisper();
+        }
+    }
+
+    /// `w`: switch between the episode's own transcript and Whisper's.
+    fn toggle_whisper(&mut self) {
+        let showing_whisper = self
+            .transcript
+            .as_ref()
+            .is_some_and(|t| t.source == Source::Whisper);
+        if showing_whisper {
+            let Some(own) = self.own_transcript.take() else {
+                self.info("This episode has no transcript of its own".into());
+                return;
+            };
+            self.stop_whisper();
+            self.transcript = Some(own);
+            self.transcript_state = TranscriptState::Ready;
+            self.align_last = None; // re-check the sync from here
+            self.transcript_follow = true;
+            self.info("Showing the episode's own transcript".into());
+            return;
+        }
+        if !whisper::AVAILABLE {
+            self.error("This build has no Whisper (build with --features whisper)".into());
+            return;
+        }
+        if self.now.is_none() {
+            return;
+        }
+        // Keep the own transcript (and its sync) to switch back to.
+        self.own_transcript = self
+            .transcript
+            .take()
+            .filter(|t| t.source != Source::Whisper);
+        let cached = transcript::load_whisper(&self.transcript_for)
+            .unwrap_or_else(|| Transcript::new(Source::Whisper, Vec::new()));
+        self.transcript = Some(cached);
+        self.transcript_state = TranscriptState::Ready;
+        self.transcript_follow = true;
+        self.stop_whisper();
+        self.start_whisper();
+        self.info("Transcribing with Whisper · w switches back".into());
+    }
+
+    /// Showing Whisper's transcript while the episode has its own to go back to.
+    pub fn can_switch_back(&self) -> bool {
+        self.own_transcript.is_some()
+            && self
+                .transcript
+                .as_ref()
+                .is_some_and(|t| t.source == Source::Whisper)
+    }
+
+    fn cycle_whisper_device(&mut self) {
+        self.cfg.whisper_device = self.cfg.whisper_device.next();
+        self.whisper_settings_changed();
+        self.info(format!(
+            "Whisper device: {} (runs on {})",
+            self.cfg.whisper_device.label(),
+            whisper::device_label(self.cfg.whisper_device)
+        ));
+    }
+
+    fn cycle_whisper_model(&mut self) {
+        let i = WHISPER_MODELS
+            .iter()
+            .position(|m| *m == self.cfg.whisper_model)
+            .map_or(0, |i| (i + 1) % WHISPER_MODELS.len());
+        self.cfg.whisper_model = WHISPER_MODELS[i].to_string();
+        self.whisper_settings_changed();
+        self.info(format!("Whisper model: {}", self.cfg.whisper_model));
+    }
+
+    fn whisper_settings_changed(&mut self) {
+        self.whisper.configure(whisper_settings(&self.cfg));
+        if let Err(e) = config::save_config(&self.cfg) {
+            self.error(format!("Couldn't save config: {e}"));
+        }
+        if self.whisper_active {
+            self.whisper_active = false;
+            self.start_whisper();
+        }
+    }
+
+    pub fn transcript_len(&self) -> usize {
+        self.transcript.as_ref().map_or(0, |t| t.cues.len())
+    }
+
+    /// Move the highlighted transcript line; stops following playback.
+    fn transcript_move(&mut self, delta: isize) {
+        let n = self.transcript_len();
+        if n == 0 {
+            return;
+        }
+        if self.transcript_follow {
+            let pos = self.now.as_ref().map_or(0.0, |n| n.position);
+            self.transcript_sel = self
+                .transcript
+                .as_ref()
+                .and_then(|t| t.current(pos))
+                .unwrap_or(0);
+            self.transcript_follow = false;
+        }
+        let cur = self.transcript_sel as isize;
+        self.transcript_sel = (cur + delta).clamp(0, n as isize - 1) as usize;
+    }
+
+    /// Jump playback to a transcript line.
+    fn seek_to_cue(&mut self, i: usize) {
+        let Some(t) = self.transcript.as_ref() else {
+            return;
+        };
+        let Some(c) = t.cues.get(i) else { return };
+        let start = t.to_audio(c.start).max(0.0);
+        if self.now.is_some() {
+            self.last_seek = Instant::now();
+            self.player.seek_absolute(start);
+            self.transcript_follow = true;
+        }
+    }
+
+    /// Keys while the transcript view is open; `true` if handled.
+    fn transcript_key(&mut self, k: KeyEvent) -> bool {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('T') => self.toggle_transcript_view(),
+            KeyCode::Down | KeyCode::Char('j') => self.transcript_move(1),
+            KeyCode::Up | KeyCode::Char('k') => self.transcript_move(-1),
+            KeyCode::PageDown => self.transcript_move(10),
+            KeyCode::PageUp => self.transcript_move(-10),
+            KeyCode::Home | KeyCode::Char('g') => self.transcript_move(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.transcript_move(isize::MAX / 2),
+            KeyCode::Enter if !self.transcript_follow => self.seek_to_cue(self.transcript_sel),
+            KeyCode::Char('c') => self.transcript_follow = true,
+            KeyCode::Char('s') if !self.transcript_follow => self.sync_to_line(self.transcript_sel),
+            KeyCode::Char('z') => self.clear_sync(),
+            KeyCode::Char('w') => self.toggle_whisper(),
+            KeyCode::Char('D') => self.cycle_whisper_device(),
+            KeyCode::Char('M') => self.cycle_whisper_model(),
+            _ => return false,
+        }
+        true
+    }
+
     /// Called a few times a second.
     pub fn tick(&mut self) {
         if let Some((_, _, at)) = &self.status
@@ -596,6 +1042,12 @@ impl App {
         {
             self.status = None;
         }
+        if self.whisper_active
+            && let Some(n) = &self.now
+        {
+            self.whisper.position(n.position);
+        }
+        self.maybe_autosync();
         let playing = self.now.as_ref().is_some_and(|n| !n.paused && !n.loading);
         if playing
             && self.last_sync.elapsed() >= Duration::from_secs(self.cfg.sync_interval.max(5).into())
@@ -682,6 +1134,7 @@ impl App {
         self.sync_progress(true);
         self.last_synced_pos = -1.0;
         self.last_seek = Instant::now();
+        self.awaiting_start = true;
         self.now = Some(NowPlaying {
             episode: ep.clone(),
             position: ep.played_up_to,
@@ -877,6 +1330,9 @@ impl App {
     }
 
     fn switch_pane(&mut self, idx: usize) {
+        if self.show_transcript {
+            self.toggle_transcript_view();
+        }
         self.sidebar = idx.min(SIDEBAR.len() - 1);
         self.pane = SIDEBAR[self.sidebar];
         if self.open_podcast.is_some() && self.episodes_from == self.pane {
@@ -931,6 +1387,9 @@ impl App {
         }
         if self.search_editing {
             self.search_key(k);
+            return;
+        }
+        if self.show_transcript && self.transcript_key(k) {
             return;
         }
         if self.filtering {
@@ -1009,6 +1468,8 @@ impl App {
             }
             KeyCode::Char('h') => self.focus = Focus::Sidebar,
             KeyCode::Char('l') => self.focus = Focus::Main,
+            KeyCode::Char('T') => self.toggle_transcript_view(),
+            _ if self.show_transcript => {}
             _ => match self.focus {
                 Focus::Sidebar => self.sidebar_key(k),
                 Focus::Main => self.main_key(k),
@@ -1210,6 +1671,9 @@ impl App {
                         self.change_volume(if up { 5.0 } else { -5.0 })
                     }
                     Some(Hit::Speed) => self.change_speed(if up { 0.1 } else { -0.1 }),
+                    Some(Hit::TranscriptLine(_) | Hit::TranscriptArea) => {
+                        self.transcript_move(dir * 3)
+                    }
                     Some(Hit::Progress) if self.now.is_some() => {
                         let secs = if up {
                             self.cfg.skip_forward
@@ -1304,16 +1768,23 @@ impl App {
                 Control::Boost => self.toggle_boost(),
                 Control::VolumeDown => self.change_volume(-5.0),
                 Control::VolumeUp => self.change_volume(5.0),
+                Control::Transcript => self.toggle_transcript_view(),
                 _ => {}
             },
             Hit::Help => self.show_help = false,
             Hit::SortToggle => self.toggle_sort(),
             Hit::PlayedToggle => self.toggle_hide_played(),
+            Hit::TranscriptLine(i) => self.seek_to_cue(i),
+            Hit::TranscriptArea => {}
         }
     }
 
     /// Right-click: queue an episode, follow/unfollow a podcast.
     fn right_click(&mut self, rect: Rect, hit: Hit, pos: Position) {
+        if let Hit::TranscriptLine(i) = hit {
+            self.sync_to_line(i);
+            return;
+        }
         let Some((pane, i)) = self.item_at(rect, hit, pos) else {
             return;
         };
@@ -1428,4 +1899,46 @@ fn err_text(e: &anyhow::Error) -> String {
         return e.to_string();
     }
     format!("{e:#}")
+}
+
+fn whisper_settings(cfg: &Config) -> whisper::Settings {
+    whisper::Settings {
+        model: cfg.whisper_model.clone(),
+        device: cfg.whisper_device,
+        threads: cfg.whisper_threads,
+        ahead: cfg.transcribe_ahead,
+        mpv: cfg.mpv_path.clone(),
+    }
+}
+
+/// The publisher's transcript, else Pocket Casts' generated one, if the episode has either.
+async fn fetch_own_transcript(api: &Client, podcast: &str, uuid: &str) -> Option<Transcript> {
+    if podcast.is_empty() {
+        return None;
+    }
+    let notes = api.show_notes(podcast).await.ok()?;
+    for offer in transcript::offers(notes.get(uuid)?) {
+        let Some(format) = transcript::format_of(&offer.mime, &offer.url) else {
+            continue;
+        };
+        let Ok(body) = api.fetch_text(&offer.url).await else {
+            continue;
+        };
+        let cues = transcript::parse(&body, format);
+        if !cues.is_empty() {
+            return Some(Transcript::new(offer.source, cues));
+        }
+    }
+    None
+}
+
+/// `+1:44 ahead` / `0:12 behind` / `in step` for a transcript offset.
+pub fn offset_label(off: f64) -> String {
+    if off.abs() < 1.0 {
+        "in step".into()
+    } else if off > 0.0 {
+        format!("text +{} ahead", crate::model::fmt_time(off))
+    } else {
+        format!("text {} behind", crate::model::fmt_time(-off))
+    }
 }

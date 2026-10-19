@@ -264,6 +264,48 @@ impl Client {
             .map(drop)
     }
 
+    /// Show-notes records (with transcript links) for every episode of a podcast, by uuid.
+    pub async fn show_notes(
+        &self,
+        podcast_uuid: &str,
+    ) -> Result<std::collections::HashMap<String, Value>> {
+        let url = format!(
+            "{}/mobile/show_notes/full/{podcast_uuid}",
+            self.inner.podcast_api
+        );
+        let resp = self
+            .inner
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("show notes")?;
+        if !resp.status().is_success() {
+            bail!("show notes failed ({})", resp.status());
+        }
+        let v: Value = resp.json().await.context("show notes: bad JSON")?;
+        let pod = v.get("podcast").unwrap_or(&Value::Null);
+        Ok(array(pod, "episodes")
+            .iter()
+            .filter_map(|e| Some((e.get("uuid")?.as_str()?.to_string(), e.clone())))
+            .collect())
+    }
+
+    /// Download a text file (a transcript), following redirects.
+    pub async fn fetch_text(&self, url: &str) -> Result<String> {
+        let resp = self
+            .inner
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("transcript")?;
+        if !resp.status().is_success() {
+            bail!("transcript download failed ({})", resp.status());
+        }
+        Ok(resp.text().await?)
+    }
+
     /// Full details for one episode (resume position, status, duration).
     pub async fn episode(&self, uuid: &str) -> Result<Value> {
         self.post("/user/episode", Some(json!({"uuid": uuid})))

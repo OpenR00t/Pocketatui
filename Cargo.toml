@@ -20,3 +20,16 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 tokio = { version = "1.53.3", features = ["full"] }
 toml = "1.1.8"
+whisper-rs = { version = "0.16", optional = true }
+unicode-width = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
+[features]
+default = []
+# Local transcription with Whisper (needs CMake and a C++ compiler to build).
+whisper = ["dep:whisper-rs"]
+# Whisper on the GPU: Vulkan (NVIDIA / AMD / Intel; needs the Vulkan SDK) or CUDA (NVIDIA; needs the CUDA toolkit).
+vulkan = ["whisper", "whisper-rs/vulkan"]
+cuda = ["whisper", "whisper-rs/cuda"]

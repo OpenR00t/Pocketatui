@@ -6,11 +6,14 @@
 mod api;
 mod app;
 mod art;
+mod cache;
 mod config;
 mod model;
 mod player;
 mod theme;
+mod transcript;
 mod ui;
+mod whisper;
 
 use std::time::Duration;
 
@@ -59,6 +62,7 @@ async fn main() -> Result<()> {
     }
 
     let cfg = config::load_config()?;
+    cache::prune_in_background(cfg.cache_limit_mb);
     let (session, password) = match config::load_session() {
         Some(s) if arg.as_deref() != Some("--login") => {
             let pw = std::env::var("POCKETCASTS_PASSWORD")

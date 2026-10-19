@@ -17,11 +17,13 @@ use image::imageops::FilterType;
 use ratatui_image::{Resize, StatefulImage};
 
 use crate::{
-    app::{App, Control, Focus, Hit, Pane, SIDEBAR},
+    app::{App, Control, Focus, Hit, Pane, SIDEBAR, TranscriptState},
     art::Art,
     config::TrimMode,
     model::{Episode, PlayStatus, fmt_len, fmt_time},
     theme::*,
+    transcript::Source,
+    whisper,
 };
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -48,7 +50,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             app.hits.push((r, Hit::Sidebar(usize::from(i))));
         }
     }
-    if App::is_grid(app.pane) {
+    if app.show_transcript {
+        transcript_view(f, app, content);
+    } else if App::is_grid(app.pane) {
         podcasts(f, app, content);
     } else {
         episodes(f, app, content);
@@ -225,6 +229,224 @@ fn episodes(f: &mut Frame, app: &mut App, area: Rect) {
     if empty {
         empty_note(f, app, area);
     }
+}
+
+/// The transcript of what's playing, following along like a lyrics view.
+fn transcript_view(f: &mut Frame, app: &mut App, area: Rect) {
+    let pos = app.now.as_ref().map_or(0.0, |n| n.position);
+    let source = app.transcript.as_ref().map(|t| t.source);
+    let title = match source {
+        Some(Source::Whisper) => format!(
+            "Transcript · Whisper {} · {}",
+            app.cfg.whisper_model,
+            whisper::device_label(app.cfg.whisper_device)
+        ),
+        Some(s) => format!("Transcript · {}", s.label()),
+        None => "Transcript".into(),
+    };
+    let outer = block(title, true);
+    let inner = outer.inner(area).inner(Margin::new(1, 0));
+    f.render_widget(outer, area);
+    app.hits.push((inner, Hit::TranscriptArea));
+
+    // Footer: what's happening, and the keys for this view.
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let mut foot = Vec::new();
+    if source == Some(Source::Whisper) {
+        let t = app.transcript.as_ref().expect("whisper transcript");
+        let upto = t
+            .covered_until(pos)
+            .map(|e| format!("ready to {}", fmt_time(e)));
+        let status = [upto.unwrap_or_default(), app.whisper_status.clone()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let warn = app.whisper_status.starts_with('⚠');
+        foot.push(Span::styled(
+            format!("{status}   "),
+            Style::new().fg(if warn { RED } else { ACCENT_2 }),
+        ));
+    }
+    if let Some(t) = app
+        .transcript
+        .as_ref()
+        .filter(|t| t.source != Source::Whisper)
+    {
+        let status = if !app.align_status.is_empty() {
+            app.align_status.clone()
+        } else if t.anchors.is_empty() {
+            if whisper::AVAILABLE && app.cfg.transcript_autosync {
+                "auto-sync starting…".into()
+            } else {
+                "not synced · select the line you hear, press s".into()
+            }
+        } else {
+            crate::app::offset_label(t.offset_at(pos))
+        };
+        foot.push(Span::styled(
+            format!("{status}   "),
+            Style::new().fg(ACCENT_2),
+        ));
+    }
+    let whisper_own = source == Some(Source::Whisper);
+    let keys: &[(&str, &str)] = match (whisper::AVAILABLE, whisper_own) {
+        (true, true) if app.can_switch_back() => &[
+            ("j/k", "scroll"),
+            ("enter", "jump"),
+            ("c", "follow"),
+            ("w", "own transcript"),
+            ("D", "device"),
+            ("M", "model"),
+            ("T", "close"),
+        ],
+        (true, true) => &[
+            ("j/k", "scroll"),
+            ("enter", "jump"),
+            ("c", "follow"),
+            ("D", "device"),
+            ("M", "model"),
+            ("T", "close"),
+        ],
+        (true, false) => &[
+            ("j/k", "scroll"),
+            ("enter", "jump"),
+            ("s", "sync line"),
+            ("z", "unsync"),
+            ("c", "follow"),
+            ("w", "whisper"),
+            ("T", "close"),
+        ],
+        (false, _) => &[
+            ("j/k", "scroll"),
+            ("enter", "jump"),
+            ("s", "sync line"),
+            ("z", "unsync"),
+            ("c", "follow"),
+            ("T", "close"),
+        ],
+    };
+    for (k, d) in keys {
+        foot.push(Span::styled(*k, hint_key()));
+        foot.push(Span::styled(format!(" {d}  "), meta()));
+    }
+    f.render_widget(Paragraph::new(Line::from(foot)), footer);
+
+    let message = match (&app.transcript_state, &app.now) {
+        (_, None) => Some("Nothing playing".to_string()),
+        (TranscriptState::Off, _) => {
+            Some("Transcripts are off (transcribe = \"off\" in config.toml)".into())
+        }
+        (TranscriptState::Loading, _) => Some("Looking for a transcript…".into()),
+        (TranscriptState::Missing(why), _) => Some(why.clone()),
+        (TranscriptState::Ready, _) if app.transcript_len() == 0 => {
+            Some(if source == Some(Source::Whisper) {
+                if app.whisper_status.is_empty() {
+                    "Starting Whisper…".into()
+                } else {
+                    app.whisper_status.clone()
+                }
+            } else {
+                "The transcript is empty".into()
+            })
+        }
+        _ => None,
+    };
+    if let Some(m) = message {
+        let mid = Rect {
+            y: body.y + body.height / 3,
+            height: 1.min(body.height),
+            ..body
+        };
+        f.render_widget(
+            Paragraph::new(m).style(meta()).alignment(Alignment::Center),
+            mid,
+        );
+        return;
+    }
+
+    let t = app.transcript.as_ref().expect("transcript");
+    let current = t.current(pos);
+    let focus = if app.transcript_follow {
+        current.unwrap_or(0)
+    } else {
+        app.transcript_sel
+    };
+    // Wrap every cue to the width, remembering which cue each line belongs to.
+    const TS: u16 = 9;
+    let text_w = body.width.saturating_sub(TS + 1).max(10) as usize;
+    let mut lines: Vec<(usize, bool, String)> = Vec::new();
+    let mut focus_line = 0;
+    for (i, c) in t.cues.iter().enumerate() {
+        if i == focus {
+            focus_line = lines.len();
+        }
+        for (j, l) in wrap(&c.text, text_w).into_iter().enumerate() {
+            lines.push((i, j == 0, l));
+        }
+    }
+    let h = body.height as usize;
+    let first = focus_line
+        .saturating_sub(h / 3)
+        .min(lines.len().saturating_sub(h));
+    for (row, (i, head, text)) in lines.iter().skip(first).take(h).enumerate() {
+        let y = body.y + row as u16;
+        let r = Rect {
+            y,
+            height: 1,
+            ..body
+        };
+        let style = match current {
+            Some(c) if *i == c => Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Some(c) if *i < c => Style::new().fg(FG4),
+            _ => Style::new().fg(FG1),
+        };
+        let selected = !app.transcript_follow && *i == app.transcript_sel;
+        let bg = if selected {
+            Style::new().bg(BG1)
+        } else {
+            Style::new()
+        };
+        let marker = if current == Some(*i) { "▌" } else { " " };
+        // Shown in your audio's time, so it matches the playbar.
+        let ts = if *head {
+            fmt_time(t.to_audio(t.cues[*i].start).max(0.0))
+        } else {
+            String::new()
+        };
+        let line = Line::from(vec![
+            Span::styled(marker, Style::new().fg(ACCENT)),
+            Span::styled(format!("{ts:>7} "), meta()),
+            Span::styled(text.clone(), style),
+        ]);
+        f.render_widget(Paragraph::new(line).style(bg), r);
+        app.hits.push((r, Hit::TranscriptLine(*i)));
+    }
+}
+
+/// Word-wrap `s` to `width` columns.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in s.split_whitespace() {
+        let need = if line.is_empty() {
+            word.width()
+        } else {
+            line.width() + 1 + word.width()
+        };
+        if need > width && !line.is_empty() {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() || out.is_empty() {
+        out.push(line);
+    }
+    out
 }
 
 /// Sort and hide-played toggles on the right of an open podcast's top border.
@@ -735,6 +957,11 @@ fn controls(f: &mut Frame, app: &mut App, row: Rect) {
         (" Next › ".into(), chip, Control::Next),
         (trim_label, trim_style, Control::Trim),
         (" ⇡ Boost ".into(), boost_style, Control::Boost),
+        (
+            " ≡ Transcript ".into(),
+            if app.show_transcript { on } else { chip },
+            Control::Transcript,
+        ),
     ];
     let mut x = row.x;
     for (label, style, ctl) in buttons {
@@ -885,6 +1112,7 @@ const HELP: &[(&str, &str)] = &[
     ("d / del", "remove from Up Next"),
     ("m / u", "mark played / unplayed"),
     ("o / x", "in a podcast: oldest first · hide played"),
+    ("T", "transcript of what's playing (click a line to jump)"),
     ("Moving around", ""),
     (
         "1-5",

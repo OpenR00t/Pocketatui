@@ -42,7 +42,69 @@ pub struct Config {
     pub trim_silence: TrimMode,
     /// Make voices louder and even out quiet speech (`b` toggles it).
     pub voice_boost: bool,
+    /// Transcripts: off, auto (the episode's own transcript, else Whisper), or whisper.
+    pub transcribe: TranscribeMode,
+    /// Whisper model, downloaded on first use: tiny.en, base.en, small.en, medium.en,
+    /// large-v3-turbo-q5_0 (and the same without `.en` for other languages).
+    pub whisper_model: String,
+    /// auto, cpu or gpu. GPU needs a build with the `vulkan` or `cuda` feature.
+    pub whisper_device: WhisperDevice,
+    /// CPU threads for Whisper; 0 = half the cores (at most 8).
+    pub whisper_threads: u32,
+    /// How many seconds of audio Whisper keeps transcribed ahead of playback.
+    pub transcribe_ahead: u32,
+    /// Keep the episode's own transcript lined up with your copy of the audio (whose ads
+    /// may differ) by checking a short Whisper sample every 30 s. Needs a Whisper build.
+    pub transcript_autosync: bool,
+    /// Size cap for cached transcripts and covers, in MB; the least recently used go
+    /// first. 0 = no cap. Whisper models aren't counted.
+    pub cache_limit_mb: u32,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TranscribeMode {
+    Off,
+    #[default]
+    Auto,
+    Whisper,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WhisperDevice {
+    #[default]
+    Auto,
+    Cpu,
+    Gpu,
+}
+
+impl WhisperDevice {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Cpu,
+            Self::Cpu => Self::Gpu,
+            Self::Gpu => Self::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "CPU",
+            Self::Gpu => "GPU",
+        }
+    }
+}
+
+/// Whisper models offered by the in-app cycle key, smallest first.
+pub const WHISPER_MODELS: &[&str] = &[
+    "tiny.en",
+    "base.en",
+    "small.en",
+    "medium.en",
+    "large-v3-turbo-q5_0",
+];
 
 /// Trim Silence levels, after the Pocket Casts mobile app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -87,6 +149,13 @@ impl Default for Config {
             cover_art: true,
             trim_silence: TrimMode::Off,
             voice_boost: false,
+            transcribe: TranscribeMode::Auto,
+            whisper_model: "small.en".into(),
+            whisper_device: WhisperDevice::Auto,
+            whisper_threads: 0,
+            transcribe_ahead: 120,
+            transcript_autosync: true,
+            cache_limit_mb: 200,
         }
     }
 }
