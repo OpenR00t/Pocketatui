@@ -136,3 +136,7 @@ that talks to it.
 
 `POCKETATUI_API_BASE` and `POCKETATUI_PODCAST_API_BASE` point the client at another server
 (used for testing against a mock).
+
+## License
+
+Licensed under the GNU Affero General Public License v3.0 or later. See [LICENSE](LICENSE).

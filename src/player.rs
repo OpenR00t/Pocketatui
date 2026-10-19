@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 The Pocketatui contributors
+
 //! Audio playback through a headless mpv driven over its JSON IPC.
 //!
 //! mpv handles streaming, seeking and pitch-preserving speed changes. On Windows the IPC

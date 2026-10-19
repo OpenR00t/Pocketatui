@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 The Pocketatui contributors
+
 //! Settings, the saved session, and the first-run login prompt.
 //!
 //! Files live in the OS config dir (`%APPDATA%\pocketatui\config` on Windows):

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 The Pocketatui contributors
+
 //! App state, key handling and the background calls to Pocket Casts.
 
 use std::{

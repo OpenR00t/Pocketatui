@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 The Pocketatui contributors
+
 //! Data types shared by the API client and the UI.
 //!
 //! Pocket Casts' private API uses several schemas for the same thing (camelCase on the

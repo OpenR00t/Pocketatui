@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 The Pocketatui contributors
+
 //! Podcast cover art: fetched from Pocket Casts' image CDN, cached on disk, drawn with
 //! ratatui-image (sixel/kitty/iTerm2 where the terminal supports it, half-blocks otherwise).
 

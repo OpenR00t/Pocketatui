@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 The Pocketatui contributors
+
 //! Client for Pocket Casts' private web-player API.
 //!
 //! There is no official public API. Endpoints follow the web player and the maintained

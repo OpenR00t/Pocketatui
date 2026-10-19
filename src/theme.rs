@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 The Pocketatui contributors
+
 //! Gruvbox Cove: Gruvbox dark with fixed roles (green primary, aqua second, yellow only for
 //! warnings), same as the spotatui fork's preset.
 #![allow(dead_code)] // the full palette is kept for future use
