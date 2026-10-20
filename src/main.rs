@@ -12,6 +12,7 @@ mod config;
 mod model;
 mod player;
 mod theme;
+mod title;
 mod transcript;
 mod ui;
 mod whisper;
@@ -94,6 +95,7 @@ async fn main() -> Result<()> {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         hook(info);
     }));
+    let mut title = title::TermTitle::new(cfg.terminal_title);
     let picker = art::ArtStore::detect_picker();
     let (tx, mut rx) = unbounded_channel();
     let mut app = app::App::new(cfg, client, player, tx, picker);
@@ -103,6 +105,7 @@ async fn main() -> Result<()> {
     let result: Result<()> = async {
         loop {
             terminal.draw(|f| ui::draw(f, &mut app))?;
+            title.update(&app);
             tokio::select! {
                 ev = events.next() => match ev {
                     Some(Ok(Event::Key(k))) if k.kind != KeyEventKind::Release => app.handle_key(k),
@@ -125,6 +128,7 @@ async fn main() -> Result<()> {
 
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
+    title.restore();
     app.shutdown().await;
     result
 }

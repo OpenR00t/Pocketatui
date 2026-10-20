@@ -61,6 +61,8 @@ pub struct Config {
     pub skip_ads: bool,
     /// Mark likely host-read sponsor segments (in blue). Never skipped.
     pub sponsor_hints: bool,
+    /// Show what's playing in the terminal's tab / window title.
+    pub terminal_title: bool,
     /// Size cap for cached transcripts and covers, in MB; the least recently used go
     /// first. 0 = no cap. Whisper models aren't counted.
     pub cache_limit_mb: u32,
@@ -162,6 +164,7 @@ impl Default for Config {
             transcript_autosync: true,
             skip_ads: true,
             sponsor_hints: true,
+            terminal_title: true,
             cache_limit_mb: 200,
         }
     }

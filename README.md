@@ -106,6 +106,9 @@ prompt.
 | speed (`1.0×`) | wheel ±0.1, click resets to 1.0× |
 | transcript line | click to jump there; right-click: "I'm hearing this line" (sync); wheel scrolls |
 
+The terminal's tab title follows what's playing (`▶ Episode · Podcast`, `❚❚` when paused)
+and goes back to what it was when you quit. `terminal_title = false` leaves it alone.
+
 When an episode finishes it's marked played, removed from Up Next, and the next one starts,
 the same as the apps.
 
@@ -131,6 +134,7 @@ transcribe_ahead = 120       # seconds Whisper keeps transcribed ahead of playba
 transcript_autosync = true   # keep episodes' own transcripts in time with your audio (Whisper builds)
 skip_ads = true              # skip ads stitched into your download (Whisper builds; see Ads)
 sponsor_hints = true         # mark likely host-read sponsor segments in blue (never skipped)
+terminal_title = true        # show what's playing in the terminal tab title
 cache_limit_mb = 200         # cap for cached transcripts + covers; 0 = no cap
 ```
 
@@ -251,6 +255,7 @@ that talks to it.
 | `src/ads.rs` | finding inserted ads and sponsor reads |
 | `src/cache.rs` | cache size cap (least recently used go first) |
 | `src/whisper.rs` | local Whisper worker (`whisper` feature) |
+| `src/title.rs` | terminal tab title |
 | `src/theme.rs` | Gruvbox Cove colors |
 | `src/config.rs` | config, saved session, keychain, login prompt |
 
