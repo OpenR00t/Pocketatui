@@ -3,6 +3,7 @@ name = "pocketatui"
 version = "0.1.0"
 description = "Pocket Casts in the terminal"
 license = "AGPL-3.0-or-later"
+repository = "https://github.com/OpenR00t/Pocketatui"
 edition = "2024"
 
 [dependencies]
@@ -33,3 +34,8 @@ whisper = ["dep:whisper-rs"]
 # Whisper on the GPU: Vulkan (NVIDIA / AMD / Intel; needs the Vulkan SDK) or CUDA (NVIDIA; needs the CUDA toolkit).
 vulkan = ["whisper", "whisper-rs/vulkan"]
 cuda = ["whisper", "whisper-rs/cuda"]
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
